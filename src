@@ -210,3 +210,86 @@ module Image_read #(
   end
 
 endmodule
+
+module image_processor (
+  input  logic clk,
+  input  logic rst,
+  input  logic [7:0] pixel_in,
+  input  logic hsync,
+  input  logic vsync,
+  output logic [7:0] pixel_out
+);
+
+
+  typedef enum logic [2:0] {
+    STATE_IDLE,
+    STATE_VSYNC,
+    STATE_HSYNC,
+    STATE_DATA,
+    STATE_CONVOLUTION,
+    STATE_OUTPUT
+  } state_t;
+  
+  state_t state, next_state;
+
+  logic [7:0] image_mem [0:2][0:2];
+  
+ 
+  parameter logic [3:0] kernel [0:2][0:2] = '{
+    '{1, 2, 1},
+    '{2, 4, 2},
+    '{1, 2, 1}
+  };
+  
+  integer i, j;
+  logic [15:0] conv_sum;
+  
+ 
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst)
+      state <= STATE_IDLE;
+    else
+      state <= next_state;
+  end
+
+  always_comb begin
+    case (state)
+      STATE_IDLE:         next_state = vsync ? STATE_VSYNC : STATE_IDLE;
+      STATE_VSYNC:        next_state = hsync ? STATE_HSYNC : STATE_VSYNC;
+      STATE_HSYNC:        next_state = STATE_DATA;
+      STATE_DATA:         next_state = STATE_CONVOLUTION;
+      STATE_CONVOLUTION:  next_state = STATE_OUTPUT;
+      STATE_OUTPUT:       next_state = hsync ? STATE_HSYNC : STATE_IDLE;
+      default:            next_state = STATE_IDLE;
+    endcase
+  end
+ 
+  always_ff @(posedge clk) begin
+    if (state == STATE_DATA) begin
+      image_mem[0][0] <= image_mem[0][1];
+      image_mem[0][1] <= image_mem[0][2];
+      image_mem[0][2] <= pixel_in;
+      
+      image_mem[1][0] <= image_mem[1][1];
+      image_mem[1][1] <= image_mem[1][2];
+      image_mem[1][2] <= image_mem[0][2];
+      
+      image_mem[2][0] <= image_mem[2][1];
+      image_mem[2][1] <= image_mem[2][2];
+      image_mem[2][2] <= image_mem[1][2];
+    end
+    
+    if (state == STATE_CONVOLUTION) begin
+      conv_sum = 0;
+      for (i = 0; i < 3; i++) begin
+        for (j = 0; j < 3; j++) begin
+          conv_sum = conv_sum + (image_mem[i][j] * kernel[i][j]);
+        end
+      end
+      pixel_out <= conv_sum >> 4;  
+    end
+  end
+  
+endmodule
+
+
