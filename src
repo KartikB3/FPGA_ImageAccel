@@ -1,0 +1,212 @@
+
+module Image_read #(
+  parameter int START_DELAY = 10,
+  parameter string IMG_FILE = "image.hex",
+  parameter int IMG_W = 256,
+  parameter int IMG_H = 256,
+  parameter int S_DELAY = 2
+)(
+  input logic clk,
+  input logic reset_n,
+  output logic vs,
+  output logic hs,
+  output logic [7:0] red_even,
+  output logic [7:0] green_even,
+  output logic [7:0] blue_even,
+  output logic [7:0] red_odd,
+  output logic [7:0] green_odd,
+  output logic [7:0] blue_odd,
+  output logic ready
+);
+
+  localparam int IMAGE_SIZE = IMG_W * IMG_H * 3;
+  localparam int KERNEL [0:8] = '{1, 2, 1, 2, 4, 2, 1, 2, 1};
+  localparam int KERNEL_SUM = 16;
+
+  typedef enum logic [1:0] {
+    STATE_IDLE,
+    STATE_VSYNC,
+    STATE_HSYNC,
+    STATE_DATA
+  } state_t;
+
+  state_t current_state, next_state;
+
+  logic [7:0] image_memory [0:IMAGE_SIZE-1];
+  int red_channel   [0:IMG_W * IMG_H - 1];
+  int green_channel [0:IMG_W * IMG_H - 1];
+  int blue_channel  [0:IMG_W * IMG_H - 1];
+
+  logic processing_start, reset_delayed;
+  logic vsync_active, hsync_active, data_processing_active;
+
+  int i, j;
+  logic [18:0] pixel_counter;
+  logic [9:0] row_counter;
+  logic [10:0] column_counter;
+
+  int temp_red, temp_green, temp_blue;
+
+  initial begin
+    $readmemh(IMG_FILE, image_memory);
+  end
+  always_ff @(posedge clk) begin
+    if (processing_start) begin
+      for (i = 0; i < IMG_H; i++) begin
+        for (j = 0; j < IMG_W; j++) begin
+          int index = IMG_W * 3 * (IMG_H - i - 1) + 3 * j;
+          red_channel[IMG_W * i + j]   = image_memory[index];
+          green_channel[IMG_W * i + j] = image_memory[index + 1];
+          blue_channel[IMG_W * i + j]  = image_memory[index + 2];
+        end
+      end
+    end
+  end
+
+  always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+      processing_start <= 0;
+      reset_delayed <= 0;
+    end else begin
+      reset_delayed <= reset_n;
+      processing_start <= (reset_n && !reset_delayed);
+    end
+  end
+  always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n)
+      current_state <= STATE_IDLE;
+    else
+      current_state <= next_state;
+  end
+  always_comb begin
+    case (current_state)
+      STATE_IDLE: next_state = (processing_start) ? STATE_VSYNC : STATE_IDLE;
+      STATE_VSYNC: next_state = (pixel_counter == START_DELAY) ? STATE_HSYNC : STATE_VSYNC;
+      STATE_HSYNC: next_state = (pixel_counter == S_DELAY) ? STATE_DATA : STATE_HSYNC;
+      STATE_DATA: begin
+        if (ready)
+          next_state = STATE_IDLE;
+        else if (column_counter >= IMG_W - 2)
+          next_state = STATE_HSYNC;
+        else
+          next_state = STATE_DATA;
+      end
+      default: next_state = STATE_IDLE;
+    endcase
+  end
+
+  // Control signals
+  always_comb begin
+    vsync_active = (current_state == STATE_VSYNC);
+    hsync_active = (current_state == STATE_HSYNC);
+    data_processing_active = (current_state == STATE_DATA);
+  end
+
+  assign vs = vsync_active;
+  assign hs = hsync_active;
+
+  // Pixel counter
+  always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n)
+      pixel_counter <= 0;
+    else if (vsync_active || hsync_active)
+      pixel_counter <= pixel_counter + 1;
+    else
+      pixel_counter <= 0;
+  end
+
+  // Row & column iteration (2-pixel step)
+  always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+      row_counter <= 1; // Skip 0 for convolution
+      column_counter <= 1;
+    end else if (data_processing_active) begin
+      if (column_counter >= IMG_W - 3) begin
+        column_counter <= 1;
+        row_counter <= row_counter + 1;
+      end else begin
+        column_counter <= column_counter + 2;
+      end
+    end
+  end
+  assign ready = (row_counter == IMG_H - 2) && (column_counter >= IMG_W - 3);
+  always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+      red_even   <= 8'd0;
+      green_even <= 8'd0;
+      blue_even  <= 8'd0;
+      red_odd    <= 8'd0;
+      green_odd  <= 8'd0;
+      blue_odd   <= 8'd0;
+    end else if (data_processing_active) begin
+      int base = row_counter * IMG_W + column_counter;
+      temp_red = (
+        red_channel[base - IMG_W - 1] * KERNEL[0] +
+        red_channel[base - IMG_W]     * KERNEL[1] +
+        red_channel[base - IMG_W + 1] * KERNEL[2] +
+        red_channel[base - 1]         * KERNEL[3] +
+        red_channel[base]             * KERNEL[4] +
+        red_channel[base + 1]         * KERNEL[5] +
+        red_channel[base + IMG_W - 1] * KERNEL[6] +
+        red_channel[base + IMG_W]     * KERNEL[7] +
+        red_channel[base + IMG_W + 1] * KERNEL[8]) / KERNEL_SUM;
+      red_even <= temp_red[7:0];
+
+      temp_green = (
+        green_channel[base - IMG_W - 1] * KERNEL[0] +
+        green_channel[base - IMG_W]     * KERNEL[1] +
+        green_channel[base - IMG_W + 1] * KERNEL[2] +
+        green_channel[base - 1]         * KERNEL[3] +
+        green_channel[base]             * KERNEL[4] +
+        green_channel[base + 1]         * KERNEL[5] +
+        green_channel[base + IMG_W - 1] * KERNEL[6] +
+        green_channel[base + IMG_W]     * KERNEL[7] +
+        green_channel[base + IMG_W + 1] * KERNEL[8]) / KERNEL_SUM;
+      green_even <= temp_green[7:0];
+
+      temp_blue = (
+        blue_channel[base - IMG_W - 1] * KERNEL[0] +
+        blue_channel[base - IMG_W]     * KERNEL[1] +
+        blue_channel[base - IMG_W + 1] * KERNEL[2] +
+        blue_channel[base - 1]         * KERNEL[3] +
+        blue_channel[base]             * KERNEL[4] +
+        blue_channel[base + 1]         * KERNEL[5] +
+        blue_channel[base + IMG_W - 1] * KERNEL[6] +
+        blue_channel[base + IMG_W]     * KERNEL[7] +
+        blue_channel[base + IMG_W + 1] * KERNEL[8]) / KERNEL_SUM;
+      blue_even <= temp_blue[7:0];
+
+      base = base + 1;
+      red_odd   <= (red_channel[base - IMG_W - 1] * KERNEL[0] +
+                    red_channel[base - IMG_W]     * KERNEL[1] +
+                    red_channel[base - IMG_W + 1] * KERNEL[2] +
+                    red_channel[base - 1]         * KERNEL[3] +
+                    red_channel[base]             * KERNEL[4] +
+                    red_channel[base + 1]         * KERNEL[5] +
+                    red_channel[base + IMG_W - 1] * KERNEL[6] +
+                    red_channel[base + IMG_W]     * KERNEL[7] +
+                    red_channel[base + IMG_W + 1] * KERNEL[8]) / KERNEL_SUM;
+
+      green_odd <= (green_channel[base - IMG_W - 1] * KERNEL[0] +
+                    green_channel[base - IMG_W]     * KERNEL[1] +
+                    green_channel[base - IMG_W + 1] * KERNEL[2] +
+                    green_channel[base - 1]         * KERNEL[3] +
+                    green_channel[base]             * KERNEL[4] +
+                    green_channel[base + 1]         * KERNEL[5] +
+                    green_channel[base + IMG_W - 1] * KERNEL[6] +
+                    green_channel[base + IMG_W]     * KERNEL[7] +
+                    green_channel[base + IMG_W + 1] * KERNEL[8]) / KERNEL_SUM;
+
+      blue_odd  <= (blue_channel[base - IMG_W - 1] * KERNEL[0] +
+                    blue_channel[base - IMG_W]     * KERNEL[1] +
+                    blue_channel[base - IMG_W + 1] * KERNEL[2] +
+                    blue_channel[base - 1]         * KERNEL[3] +
+                    blue_channel[base]             * KERNEL[4] +
+                    blue_channel[base + 1]         * KERNEL[5] +
+                    blue_channel[base + IMG_W - 1] * KERNEL[6] +
+                    blue_channel[base + IMG_W]     * KERNEL[7] +
+                    blue_channel[base + IMG_W + 1] * KERNEL[8]) / KERNEL_SUM;
+    end
+  end
+
+endmodule
